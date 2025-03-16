@@ -1,8 +1,7 @@
 <template>
     <div class="video-list">
         <div v-for="item in videoList"
-             v-bind:video="item"
-             v-bind:key="item.id"
+             :key="item.id"
              class="video-item">
             <video controls autoplay playsinline ref="videos" :height="cameraHeight" :muted="item.muted" :id="item.id"></video>
         </div>
@@ -10,241 +9,452 @@
 </template>
 
 <script>
-    import { defineComponent } from 'vue';
-    import { io } from "socket.io-client";
-    const SimpleSignalClient = require('simple-signal-client');
+import { defineComponent, ref, onMounted, onBeforeUnmount } from 'vue';
+import { io } from "socket.io-client";
+//import SimpleSignalClient from 'simple-signal-client'; //Consider deprecating and implement yourself
 
-    export default /*#__PURE__*/defineComponent({
-        name: 'vue-webrtc',
-        components: {
-        },
-        data() {
-            return {
-                signalClient: null,
-                videoList: [],
-                canvas: null,
-                socket: null
-            };
-        },
-        props: {
-            roomId: {
-                type: String,
-                default: 'public-room-v2'
-            },
-            socketURL: {
-                type: String,
-                default: 'https://weston-vue-webrtc-lobby.azurewebsites.net'
-                //default: 'https://localhost:3000'
-                //default: 'https://192.168.1.201:3000'
-            },
-            cameraHeight: {
-                type: [Number, String],
-                default: 160
-            },
-            autoplay: {
-                type: Boolean,
-                default: true
-            },
-            screenshotFormat: {
-                type: String,
-                default: 'image/jpeg'
-            },
-            enableAudio: {
-                type: Boolean,
-                default: true
-            },
-            enableVideo: {
-                type: Boolean,
-                default: true
-            },
-            enableLogs: {
-                type: Boolean,
-                default: false
-            },
-            peerOptions: {
-                type: Object,  // NOTE: use these options: https://github.com/feross/simple-peer
-                default() {
-                    return {};
-                }
-            },
-            ioOptions: {
-                type: Object,  // NOTE: use these options: https://socket.io/docs/v4/client-options/
-                default() {
-                    return { rejectUnauthorized: false, transports: ['polling', 'websocket'] };
-                }
-            },
-            deviceId: {
-                type: String,
-                default: null
+// Helper function for generating random room IDs
+function generateRoomId() {
+    const crypto = window.crypto || window.msCrypto; // For cross-browser compatibility
+    const buffer = new Uint8Array(20);
+    crypto.getRandomValues(buffer);
+    return Array.from(buffer, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export default defineComponent({
+    name: 'vue-webrtc',
+    props: {
+        roomId: {
+            type: String,
+            default() {
+                return generateRoomId(); // Generate a unique room ID by default
             }
         },
-        watch: {
+        socketURL: {
+            type: String,
+            required: true, // Make this required and enforce HTTPS in production
+            validator: (url) => url.startsWith('https://') // Enforce HTTPS
         },
-        mounted() {
+        cameraHeight: {
+            type: [Number, String],
+            default: 160
         },
-        methods: {
-            async join() {
-                var that = this;
-                this.log('join');
-                this.socket = io(this.socketURL, this.ioOptions);
-                this.signalClient = new SimpleSignalClient(this.socket);
-                let constraints = {
-                    video: that.enableVideo,
-                    audio: that.enableAudio
-                };
-                if (that.deviceId && that.enableVideo) {
-                    constraints.video = { deviceId: { exact: that.deviceId } };
+        autoplay: {
+            type: Boolean,
+            default: true
+        },
+        screenshotFormat: {
+            type: String,
+            default: 'image/jpeg'
+        },
+        enableAudio: {
+            type: Boolean,
+            default: true
+        },
+        enableVideo: {
+            type: Boolean,
+            default: true
+        },
+        enableLogs: {
+            type: Boolean,
+            default: false
+        },
+        peerOptions: {
+            type: Object,
+            default: () => ({}) // Return a new object
+        },
+        //REMOVE rejectUnauthorized - this is a HUGE SECURITY RISK and should never be used in production
+        ioOptions: {
+            type: Object,
+            default: () => {
+                return {transports: ['polling', 'websocket'] }; // Removed rejectUnauthorized
+            }
+        },
+        deviceId: {
+            type: String,
+            default: null
+        },
+        //ADD: JWT Token Prop for Authentication
+        jwtToken: {
+            type: String,
+            default: null //Require a JWT token for secured access
+        }
+    },
+    setup(props, { emit }) {
+        const signalClient = ref(null);
+        const videoList = ref([]);
+        const socket = ref(null);
+        const videos = ref([]);
+
+        // Centralized logging function
+        const log = (message, data) => {
+            if (props.enableLogs) {
+                console.log(message, data || '');
+            }
+        };
+
+        //Joining Room Function
+        const joinRoom = async () => {
+            log('Joining room...');
+
+            //Authentication
+            if (!props.jwtToken) {
+                console.error("JWT Token is Required");
+                return;
+            }
+
+            socket.value = io(props.socketURL, {
+                ...props.ioOptions,
+                auth: {
+                    token: props.jwtToken
                 }
-                const localStream = await navigator.mediaDevices.getUserMedia(constraints);
-                this.log('opened', localStream);
-                this.joinedRoom(localStream, true);
-                this.signalClient.once('discover', (discoveryData) => {
-                    that.log('discovered', discoveryData)
-                    async function connectToPeer(peerID) {
-                        if (peerID == that.socket.id) return;
-                        try {
-                            that.log('Connecting to peer');
-                            const { peer } = await that.signalClient.connect(peerID, that.roomId, that.peerOptions);
-                            that.videoList.forEach(v => {
-                                if (v.isLocal) {
-                                    that.onPeer(peer, v.stream);
-                                }
-                            })
-                        } catch (e) {
-                            that.log('Error connecting to peer');
-                        }
+            });
+
+            //Error Handling
+            socket.value.on('connect_error', (err) => {
+                console.error('Socket connection error:', err);
+                emit('socket-error', err); //Emit error for parent component to handle
+            });
+
+            //Simple-signal-client
+            //try {
+            //    signalClient.value = new SimpleSignalClient(socket.value);
+            //} catch (error) {
+            //    console.error("Signal client initialization failed: ", error);
+            //    return;
+            //}
+
+            const constraints = {
+                video: props.enableVideo,
+                audio: props.enableAudio,
+            };
+
+            if (props.deviceId && props.enableVideo) {
+                constraints.video = { deviceId: { exact: props.deviceId } };
+            }
+
+            let localStream = null;
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia(constraints);
+                log('getUserMedia success', localStream);
+            } catch (error) {
+                console.error("getUserMedia failed:", error);
+                emit('media-error', error);
+                return;
+            }
+
+            joinedRoom(localStream, true);
+
+            //New Way of Handeling Signaling
+            socket.value.on("discover", (discoveryData) => {
+                log('discovered', discoveryData);
+
+                discoveryData.peers.forEach(peerID => {
+                    if (peerID !== socket.value.id) {
+                        connectToPeer(peerID);
                     }
-                    discoveryData.peers.forEach((peerID) => connectToPeer(peerID));
-                    that.$emit('opened-room', that.roomId);
                 });
-                this.signalClient.on('request', async (request) => {
-                    that.log('requested', request)
-                    const { peer } = await request.accept({}, that.peerOptions)
-                    that.log('accepted', peer);
-                    that.videoList.forEach(v => {
-                        if (v.isLocal) {
-                            that.onPeer(peer, v.stream);
-                        }
-                    })
-                })
-                this.signalClient.discover(that.roomId);
-            },
-            onPeer(peer, localStream) {
-                var that = this;
-                that.log('onPeer');
-                peer.addStream(localStream);
-                peer.on('stream', (remoteStream) => {
-                    that.joinedRoom(remoteStream, false);
-                    peer.on('close', () => {
-                        var newList = [];
-                        that.videoList.forEach(function (item) {
-                            if (item.id !== remoteStream.id) {
-                                newList.push(item);
-                            }
-                        });
-                        that.videoList = newList;
-                        that.$emit('left-room', remoteStream.id);
-                    });
-                    peer.on('error', (err) => {
-                        that.log('peer error ', err);
-                    });
-                });
-            },
-            joinedRoom(stream, isLocal) {
-                var that = this;
-                let found = that.videoList.find(video => {
-                    return video.id === stream.id
-                })
-                if (found === undefined) {
-                    let video = {
-                        id: stream.id,
-                        muted: isLocal,
-                        stream: stream,
-                        isLocal: isLocal
+
+                emit('opened-room', props.roomId);
+            });
+
+            socket.value.on("request", async (request) => {
+                log("request", request);
+                try {
+                    // Accept peer request and add local stream to the peer connection
+                    const peer = new RTCPeerConnection(props.peerOptions);
+
+                    // Add local stream to peer
+                    localStream.getTracks().forEach(track => peer.addTrack(track, localStream));
+
+                    // Set up event handlers for the peer connection
+                    peer.ontrack = (event) => {
+                        log("Received remote stream");
+                        joinedRoom(event.streams[0], false);
                     };
 
-                    that.videoList.push(video);
-                }
-
-                setTimeout(function () {
-                    for (var i = 0, len = that.$refs.videos.length; i < len; i++) {
-                        if (that.$refs.videos[i].id === stream.id) {
-                            that.$refs.videos[i].srcObject = stream;
-                            break;
+                    peer.onicecandidate = (event) => {
+                        if (event.candidate) {
+                            socket.value.emit("ice-candidate", {
+                                target: request.socketId,
+                                candidate: event.candidate
+                            });
                         }
-                    }
-                }, 500);
+                    };
 
-                that.$emit('joined-room', stream.id);
-            },
-            leave() {
-                this.videoList.forEach(v => v.stream.getTracks().forEach(t => t.stop()));
-                this.videoList = [];
-                this.signalClient.peers().forEach(peer => peer.removeAllListeners())
-                this.signalClient.destroy();
-                this.signalClient = null;
-                this.socket.destroy();
-                this.socket = null;
-            },
-            capture() {
-                return this.getCanvas().toDataURL(this.screenshotFormat);
-            },
-            getCanvas() {
-                let video = this.$refs.videos[0];
-                if (video !== null && !this.ctx) {
-                    let canvas = document.createElement('canvas');
-                    canvas.height = video.clientHeight;
-                    canvas.width = video.clientWidth;
-                    this.canvas = canvas;
-                    this.ctx = canvas.getContext('2d');
+                    peer.oniceconnectionstatechange = () => {
+                        if (peer.iceConnectionState === "disconnected") {
+                            console.log("Peer disconnected");
+                        }
+                    };
+
+                    // Create offer and send it to the peer
+                    const offer = await peer.createOffer();
+                    await peer.setLocalDescription(offer);
+
+                    socket.value.emit("offer", {
+                        target: request.socketId,
+                        offer: offer
+                    });
+
+                    // Handle incoming answer from the peer
+                    socket.value.on("answer", async (data) => {
+                        if (data.socketId === request.socketId) {
+                            try {
+                                await peer.setRemoteDescription(data.answer);
+                            } catch (error) {
+                                console.error("Error setting remote description: ", error);
+                            }
+                        }
+                    });
+
+                    // Handle incoming ICE candidates from the peer
+                    socket.value.on("ice-candidate", async (data) => {
+                        if (data.socketId === request.socketId && data.candidate) {
+                            try {
+                                await peer.addIceCandidate(data.candidate);
+                            } catch (error) {
+                                console.error("Error adding ICE candidate: ", error);
+                            }
+                        }
+                    });
+
+                } catch (error) {
+                    console.error("Error accepting peer request:", error);
                 }
-                const { ctx, canvas } = this;
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                return canvas;
-            },
-            async shareScreen() {
-                var that = this;
-                if (navigator.mediaDevices == undefined) {
-                    that.log('Error: https is required to load cameras');
-                    return;
-                }
+
+            });
+
+            const connectToPeer = async (peerID) => {
+                if (peerID === socket.value.id) return;
+                log(`Connecting to peer: ${peerID}`);
 
                 try {
-                    var screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-                    this.joinedRoom(screenStream, true);
-                    that.$emit('share-started', screenStream.id);
-                    that.signalClient.peers().forEach(p => that.onPeer(p, screenStream));
-                } catch (e) {
-                    that.log('Media error: ' + JSON.stringify(e));
-                }
-            },
-            log(message, data) {
-                if (this.enableLogs) {
-                    console.log(message);
-                    if (data != null) {
-                        console.log(data);
+                    // Create a new RTCPeerConnection
+                    const peerConnection = new RTCPeerConnection(props.peerOptions);
+
+                    // Add local stream to peer connection
+                    localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+                    peerConnection.ontrack = (event) => {
+                        log("Received remote stream");
+                        joinedRoom(event.streams[0], false);
+                    };
+
+                    peerConnection.onicecandidate = (event) => {
+                        if (event.candidate) {
+                            socket.value.emit("ice-candidate", {
+                                target: peerID,
+                                candidate: event.candidate
+                            });
+                        }
+                    };
+
+                    socket.value.on("ice-candidate", async (data) => {
+                        if (data.socketId === peerID && data.candidate) {
+                            try {
+                                await peerConnection.addIceCandidate(data.candidate);
+                            } catch (error) {
+                                console.error("Error adding ICE candidate: ", error);
+                            }
+                        }
+                    });
+
+                    // Create offer
+                    const offer = await peerConnection.createOffer();
+                    await peerConnection.setLocalDescription(offer);
+
+                    socket.value.emit("offer", {
+                        target: peerID,
+                        offer: offer
+                    });
+
+                    socket.value.on("answer", async (data) => {
+                        if (data.socketId === peerID) {
+                            try {
+                                await peerConnection.setRemoteDescription(data.answer);
+                            } catch (error) {
+                                console.error("Error setting remote description: ", error);
+                            }
+                        }
+                    });
+
+                    socket.value.on("ice-candidate", async (data) => {
+                        if (data.socketId === peerID && data.candidate) {
+                            try {
+                                await peerConnection.addIceCandidate(data.candidate);
+                            } catch (error) {
+                                console.error("Error adding ICE candidate: ", error);
+                            }
+                        }
+                    });
+
+                    peerConnection.oniceconnectionstatechange = () => {
+                        if (peerConnection.iceConnectionState === "disconnected") {
+                            console.log("Peer disconnected");
+                        }
+                    };
+
+                    peerConnection.onerror = (error) => {
+                        console.error("Peer connection error: ", error);
                     }
+
+                } catch (error) {
+                    console.error("Error connecting to peer:", error);
                 }
+            };
+
+            socket.value.emit("discover", props.roomId);
+
+        };
+
+        const onPeer = (peer, localStream) => {
+            log('onPeer');
+            peer.addStream(localStream);
+
+            peer.on('stream', (remoteStream) => {
+                joinedRoom(remoteStream, false);
+
+                peer.on('close', () => {
+                    videoList.value = videoList.value.filter(item => item.id !== remoteStream.id);
+                    emit('left-room', remoteStream.id);
+                });
+
+                peer.on('error', (err) => {
+                    log('peer error ', err);
+                    emit('peer-error', err);
+                });
+            });
+        };
+
+        const joinedRoom = (stream, isLocal) => {
+            const found = videoList.value.find(video => video.id === stream.id);
+
+            if (!found) {
+                const video = {
+                    id: stream.id,
+                    muted: isLocal,
+                    stream: stream,
+                    isLocal: isLocal
+                };
+
+                videoList.value.push(video);
             }
-        }
-    });
+
+            // Using nextTick to ensure videos are rendered before assigning srcObject
+            nextTick(() => {
+                videos.value.forEach(videoElement => {
+                    if (videoElement.id === stream.id) {
+                        videoElement.srcObject = stream;
+                    }
+                });
+            });
+
+            emit('joined-room', stream.id);
+        };
+
+        const leaveRoom = () => {
+            log('Leaving room');
+
+            videoList.value.forEach(v => v.stream.getTracks().forEach(t => t.stop()));
+            videoList.value = [];
+
+            //if (signalClient.value) {
+            //    signalClient.value.peers().forEach(peer => peer.removeAllListeners());
+            //    signalClient.value.destroy();
+            //    signalClient.value = null;
+            //}
+
+            if (socket.value) {
+                socket.value.disconnect();
+                socket.value = null;
+            }
+
+            emit('left-room', props.roomId);
+        };
+
+        const capture = () => {
+            return getCanvas().toDataURL(props.screenshotFormat);
+        };
+
+        const getCanvas = () => {
+            const video = videos.value[0];
+
+            if (!video) {
+                console.warn("No video element found for capturing.");
+                return null;
+            }
+
+            const canvas = document.createElement('canvas');
+            canvas.height = video.clientHeight;
+            canvas.width = video.clientWidth;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            return canvas;
+        };
+
+        const shareScreen = async () => {
+            log("Starting screen share...");
+            if (!navigator.mediaDevices) {
+                console.error('HTTPS is required to load cameras for screen sharing.');
+                emit('media-error', 'HTTPS is required for screen sharing');
+                return;
+            }
+
+            try {
+                const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+                joinedRoom(screenStream, true);
+                emit('share-started', screenStream.id);
+
+                //if (signalClient.value) {
+                //    signalClient.value.peers().forEach(p => onPeer(p, screenStream));
+                //}
+            } catch (error) {
+                console.error('Error sharing screen:', error);
+                emit('media-error', error);
+            }
+        };
+
+        onMounted(() => {
+            joinRoom();
+        });
+
+        onBeforeUnmount(() => {
+            leaveRoom();
+        });
+
+        return {
+            signalClient,
+            videoList,
+            socket,
+            videos,
+            joinRoom,
+            leaveRoom,
+            capture,
+            getCanvas,
+            shareScreen,
+            log
+        };
+    }
+});
 </script>
+
 <style scoped>
-    .video-list {
-        background: whitesmoke;
-        height: auto;
-        display: flex;
-        flex-direction: row;
-        justify-content: center;
-        flex-wrap: wrap;
-    }
+.video-list {
+    background: whitesmoke;
+    height: auto;
+    display: flex;
+    flex-direction: row;
+    justify-content: center;
+    flex-wrap: wrap;
+}
 
-        .video-list div {
-            padding: 0px;
-        }
+.video-list div {
+    padding: 0;
+}
 
-    .video-item {
-        background: #c5c4c4;
-        display: inline-block;
-    }
+.video-item {
+    background: #c5c4c4;
+    display: inline-block;
+}
 </style>
